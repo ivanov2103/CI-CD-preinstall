@@ -1,0 +1,8 @@
+---
+name: preinstall
+version: 1.0.0
+description: Preinstall CI/CD variables and K8S namespaces with account and limits for Gitlab projects
+maintainers:
+  - name: FName LName
+    email: mail@example.com
+appVersion: 1.0.0

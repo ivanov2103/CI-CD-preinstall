@@ -1,0 +1,17 @@
+{{- $namespace := .Values.namespace.name -}}
+{{- $rolename := .Values.roleRef.name -}}
+{{- range .Values.environment }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $namespace }}-{{ . }}-rb
+  namespace: {{ $namespace }}-{{ . }}
+roleRef:
+  kind: ClusterRole
+  name: {{ $rolename }}
+  apiGroup: rbac.authorization.k8s.io
+subjects:
+  - kind: ServiceAccount
+    name: {{ $namespace }}-admin
+---
+{{- end }}

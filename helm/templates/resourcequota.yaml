@@ -1,0 +1,24 @@
+{{- $namespace := .Values.namespace.name -}}
+{{- $resourcequota := .Values.resourcequota -}}
+{{- range .Values.environment }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ $namespace  }}-{{ . }}-quotas
+  namespace: {{ $namespace  }}-{{ . }}
+spec:
+  hard:
+    {{- if eq . "dev" }}
+    requests.cpu: {{ $resourcequota.cpu.requests.dev }}
+    requests.memory: {{ $resourcequota.memory.requests.dev }}
+    limits.cpu: {{ $resourcequota.cpu.limit.dev }}
+    limits.memory: {{ $resourcequota.memory.limit.dev }}
+    {{- end }}
+    {{- if eq . "test" }}
+    requests.cpu: {{ $resourcequota.cpu.requests.test }}
+    requests.memory: {{ $resourcequota.memory.requests.test }}
+    limits.cpu: {{ $resourcequota.cpu.limit.test }}
+    limits.memory: {{ $resourcequota.memory.limit.test }}
+    {{- end }}
+---
+{{- end }}

@@ -1,0 +1,199 @@
+stages:
+  - check_prj
+  - preinstall
+  - delete
+
+check_prj:
+  stage: check_prj
+  script:
+    - check_prj
+
+set_registry:
+  stage: preinstall
+  script:
+    - set_registry
+  only:
+    - master
+
+set_k8s:
+  stage: preinstall
+  script:
+    - set_k8s
+  only:
+    - master
+
+delete:
+  stage: delete
+  script:
+    - delete
+  when: manual
+  only:
+    - delete
+
+.auto_devops: &auto_devops |
+  echo "Если переменная TRACE задана, включаем отладочный режим в bash. \
+  =========================================================================================="
+  TRACE=
+  [[ "$TRACE" ]] && set -x
+
+  echo "Экспортируем переменные окружения из файла .ci_env. \
+  =========================================================================================="
+  export $(grep -v '^#' .ci_env | xargs)
+
+  echo "Получаем идентификатор проекта Gitlab, сохраняем в переменную окружения. \
+  =========================================================================================="
+  export PROJECT_PATH_CONV=$(echo $PROJECT_URL | sed -r 's:(.*)(.git)$:\1:' | \
+  sed -r 's:^([^/]*/){3}::' | sed -r 's:([a-zA-Z0-9])[^/]*/:\1-:g' | sed 's/[^a-zA-Z0-9]/-/g' | \
+  awk '{print tolower($0)}')
+  
+  echo "Получаем полный путь проекта, подготовленный для запросов к REST API Gitlab. \
+  =========================================================================================="
+  export PROJECT_FUUL_PATH=$(echo $PROJECT_URL | sed 's:\(.*\)\(.git\)$:\1:' | sed 's:^\([^/]*/\)\{3\}::' | sed 's:\/:%2F:g')
+
+  echo "Проверяем валидность URL проекта Gitlab. \
+  =========================================================================================="
+  function check_prj() {
+    if [[ $(curl -k -LI $PROJECT_URL -w '%{http_code}\n' -s -o /dev/null) != 200 ]]
+    then
+      echo "Project URL not valid"
+      exit 1
+    else
+      exit 0
+    fi
+  }
+
+  function set_registry() {
+    echo "Обновляем TTL токена Vault. \
+    =========================================================================================="
+    curl -s -H "X-Vault-Token: $CI_VAULT_TOKEN" -X POST $CI_VAULT_ADDR/v1/auth/token/renew-self &> /dev/null
+
+    echo "Получаем логин и пароль доменной сервисной учетной записи для доступа к Harbor. \
+    =========================================================================================="
+    export CI_REGISTRY_USER=$(curl -s -H "X-Vault-Token: $CI_VAULT_TOKEN" $CI_VAULT_ADDR/v1/$VAULT_ROOT_PATH/$PROJECT_PATH_CONV | sed 's/^.*"data":{\(.*\)},.*/\1/' | sed 's/^"\(.*\)":.*"\(.*\)"$/\1/')
+    export CI_REGISTRY_PASSWORD=$(curl -s -H "X-Vault-Token: $CI_VAULT_TOKEN" $CI_VAULT_ADDR/v1/$VAULT_ROOT_PATH/$PROJECT_PATH_CONV | sed 's/^.*"data":{\(.*\)},.*/\1/' | sed 's/^"\(.*\)":.*"\(.*\)"$/\2/')
+
+    echo "Если переменные окружения CI/CD для доступа к проекту Harbor были определены ранее, удаляем их. \
+    =========================================================================================="
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/CI_REGISTRY_PASSWORD &> /dev/null
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/CI_REGISTRY_USER &> /dev/null
+    
+    echo "Устанавливаем переменные окружения CI/CD для доступа к проекту Harbor. \
+    =========================================================================================="
+    curl -s -X POST -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables --form "key=CI_REGISTRY_PASSWORD" --form "value=$CI_REGISTRY_PASSWORD" &> /dev/null
+    curl -s -X POST -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables --form "key=CI_REGISTRY_USER" --form "value=$CI_REGISTRY_USER" &> /dev/null
+
+    echo "Создаем проект в Harbor. \
+    =========================================================================================="
+    echo '{
+      "project_name": "'"$PROJECT_PATH_CONV"'",
+      "metadata": {
+        "public": "false"
+      }
+    }' | curl -s -u $CI_HARBOR_USER:$CI_HARBOR_PASSWORD -H "Content-Type: application/json" -X POST -d @- $CI_HARBOR_URL/api/projects &> /dev/null
+
+    echo "Определяем ID созданного проекта Harbor. \
+    =========================================================================================="
+    export HARBOR_PRJ_ID=$(curl -u $CI_HARBOR_USER:$CI_HARBOR_PASSWORD -s -X GET $CI_HARBOR_URL/api/projects?name=$PROJECT_PATH_CONV | grep "project_id" | sed 's/[^0-9]//g')
+
+    echo "Добавляем доменную учетную запись в список пользователей Harbor. \
+    =========================================================================================="
+    echo '{
+      "ldap_uid_list": [
+        "'"$CI_REGISTRY_USER"'"
+      ]
+    }' | curl -s -u $CI_HARBOR_USER:$CI_HARBOR_PASSWORD -H "Content-Type: application/json" -X POST -d @- $CI_HARBOR_URL/api/ldap/users/import &> /dev/null
+
+    echo "Добавляем доменную учетную запись в созданный проект Harbor с ролью Project Admin. \
+    =========================================================================================="
+    echo '{
+      "role_id": 1,
+      "member_user": {
+        "username": "'"$CI_REGISTRY_USER"'"
+      }
+    }' | curl -s -u $CI_HARBOR_USER:$CI_HARBOR_PASSWORD -H "Content-Type: application/json" -X POST -d @- $CI_HARBOR_URL/api/projects/$HARBOR_PRJ_ID/members &> /dev/null
+  }
+
+  function set_k8s() {
+    echo "Устанавливаем необходимые пакеты и утилиты. \
+    =========================================================================================="
+    yum install epel-release -y -q &> /dev/null
+    yum install jq -y -q &> /dev/null
+    curl -s https://storage.googleapis.com/kubernetes-helm/helm-v$HELM_VER-linux-amd64.tar.gz | tar -xzvf - -C /usr/bin/ --strip-components=1 && chmod +x /usr/bin/helm &> /dev/null 
+    curl -s -o /usr/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/v$KUBECTL_VER/bin/linux/amd64/kubectl && chmod +x /usr/bin/kubectl &> /dev/null
+
+    echo "Настраиваем kubectl для доступа к кластеру Kubernetes. \
+    =========================================================================================="
+    kubectl config set-cluster $K8S_CLUSTER --server="$K8S_URL" --insecure-skip-tls-verify &> /dev/null
+    kubectl config set-credentials admin --token="$K8S_TOKEN" &> /dev/null
+    kubectl config set-context default-context --cluster=$K8S_CLUSTER --user=admin &> /dev/null
+    kubectl config use-context default-context &> /dev/null
+
+    echo "Устанавливаем (или обновляем) tiller. \
+    =========================================================================================="
+    helm init --upgrade --tiller-namespace kube-system --history-max 10 --service-account $K8S_SACCOUNT
+
+    echo "Устанавливаем релиз Helm. \
+    =========================================================================================="
+    helm upgrade --install $CI_PROJECT_PATH_SLUG ./helm --set namespace.name=$PROJECT_PATH_CONV --wait --timeout 300
+
+    echo "Получаем токен сервисного аккаунта Kubernetes с ролью edit в namespaces проекта разработки. \
+    =========================================================================================="
+    export K8S_SECRET_NAME=$(kubectl get serviceaccounts $PROJECT_PATH_CONV-admin -o json -n $PROJECT_PATH_CONV | jq -r '.secrets[0].name')
+    export K8S_TOKEN=$(kubectl -o json get secret $K8S_SECRET_NAME -n $PROJECT_PATH_CONV | jq -r '.data."token"' | base64 -d -)
+
+    echo "Если переменные окружения CI/CD для доступа к кластеру Kubernetes были определены ранее, удаляем их. \
+    =========================================================================================="
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/K8S_URL &> /dev/null
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/K8S_CLUSTER &> /dev/null
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/K8S_NAMESPACE_BASE &> /dev/null
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/K8S_TOKEN &> /dev/null
+
+    echo "Устанавливаем переменные окружения CI/CD для доступа к кластеру Kubernetes. \
+    =========================================================================================="
+    curl -s -X POST -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables --form "key=K8S_URL" --form "value=$K8S_URL" &> /dev/null
+    curl -s -X POST -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables --form "key=K8S_CLUSTER" --form "value=$K8S_CLUSTER" &> /dev/null
+    curl -s -X POST -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables --form "key=K8S_NAMESPACE_BASE" --form "value=$PROJECT_PATH_CONV" &> /dev/null
+    curl -s -X POST -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables --form "key=K8S_TOKEN" --form "value=$K8S_TOKEN" &> /dev/null
+  }
+
+  function delete() {
+    echo "Устанавливаем необходимые пакеты и утилиты. \
+    =========================================================================================="
+    yum install epel-release -y -q &> /dev/null
+    yum install jq -y -q &> /dev/null
+    curl -s https://storage.googleapis.com/kubernetes-helm/helm-v$HELM_VER-linux-amd64.tar.gz | tar -xzvf - -C /usr/bin/ --strip-components=1 && chmod +x /usr/bin/helm &> /dev/null
+    curl -s -o /usr/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/v$KUBECTL_VER/bin/linux/amd64/kubectl && chmod +x /usr/bin/kubectl &> /dev/null
+
+    echo "Настраиваем kubectl для доступа к кластеру Kubernetes. \
+    =========================================================================================="
+    kubectl config set-cluster $K8S_CLUSTER --server="$K8S_URL" --insecure-skip-tls-verify &> /dev/null
+    kubectl config set-credentials admin --token="$K8S_TOKEN" &> /dev/null
+    kubectl config set-context default-context --cluster=$K8S_CLUSTER --user=admin &> /dev/null
+    kubectl config use-context default-context &> /dev/null
+
+    echo "Устанавливаем (или обновляем) tiller. \
+    =========================================================================================="
+    helm init --upgrade --tiller-namespace kube-system --history-max 10 --service-account $K8S_SACCOUNT
+
+    echo "Удаляем релиз Helm. \
+    =========================================================================================="
+    helm delete $CI_PROJECT_PATH_SLUG --purge
+
+    echo "Удаляем все, устанавленные ранее, переменные окружения CI/CD. \
+    =========================================================================================="
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/CI_REGISTRY_PASSWORD &> /dev/null
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/CI_REGISTRY_USER &> /dev/null
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/CI_PROJECT_PATH_CONV &> /dev/null
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/K8S_URL &> /dev/null
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/K8S_CLUSTER &> /dev/null
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/K8S_NAMESPACE_BASE &> /dev/null
+    curl -s -X DELETE -H "PRIVATE-TOKEN: $CI_GITLAB_ADMIN_TOKEN" $CI_API_V4_URL/projects/$PROJECT_FUUL_PATH/variables/K8S_TOKEN &> /dev/null
+
+    echo "Удаляем проект в Harbor. \
+    =========================================================================================="
+    export HARBOR_PRJ_ID=$(curl -u $CI_HARBOR_USER:$CI_HARBOR_PASSWORD -s -X GET $CI_HARBOR_URL/api/projects?name=$PROJECT_PATH_CONV | grep "project_id" | sed 's/[^0-9]//g')
+    curl -s -u $CI_HARBOR_USER:$CI_HARBOR_PASSWORD -X DELETE $CI_HARBOR_URL/api/projects/$HARBOR_PRJ_ID &> /dev/null
+    }
+
+before_script:
+  - *auto_devops
